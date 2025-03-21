@@ -1,0 +1,239 @@
+services:
+  db:
+    image: postgres:latest
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: 1987
+      POSTGRES_DB: orders_db
+    networks:
+      - webapp-network
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "admin", "-d", "orders_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  webapp:
+    image: backend-webapp-orders:latest
+    build:
+      context: ./backend/
+      dockerfile: OrdersAPI/OrdersAPI.API/Dockerfile
+    environment:
+      - ASPNETCORE_URLS=http://+:5000
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__DbConnection=Host=db;Port=5432;Username=admin;Password=1987;Database=orders_db
+      - RabbitMq__ConnectionString=amqp://guest:guest@rabbitmq:5672
+      - Redis__Connection=redis,password=admin,ssl=False,abortConnect=False
+      - JwtSettings__Secret=your-32-byte-long-secret-key-here-your-32-byte-long
+      - JwtSettings__Issuer=your-issuer
+      - JwtSettings__Audience=your-audience
+      - JwtSettings__ExpirationInMinutes=60
+      - UploadSettings__Path=/app/uploads
+    ports:
+      - "5000:5000"
+    networks:
+      - webapp-network
+    volumes:
+      - ./backend/uploads:/app/uploads:rw
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  nginx:
+    image: nginx:alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+      - ./backend/uploads:/app/uploads:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - frontend
+      - webapp
+    networks:
+      - webapp-network
+    restart: always
+
+  redis:
+    image: redis:latest
+    command: >
+      --requirepass admin
+      --appendonly yes
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --protected-mode yes
+      --bind 0.0.0.0
+      --tcp-backlog 511
+    environment:
+      - TZ=America/Sao_Paulo
+    volumes:
+      - redis_data:/data
+    networks:
+      - webapp-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "admin", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      nproc: 65535
+      nofile:
+        soft: 65535
+        hard: 65535
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    networks:
+      - webapp-network
+    volumes:
+      - ./frontend/public:/usr/share/nginx/html/public:ro
+      - ./frontend/dist:/usr/share/nginx/html/dist:ro
+    restart: always
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: always
+    ports: 
+      - "15672:15672"
+      - "5672:5672"
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbitmq_management vm_memory_high_watermark 0.4"
+      RABBITMQ_DISK_FREE_LIMIT: "2GB"
+      RABBITMQ_PLUGINS: "rabbitmq_management rabbitmq_prometheus"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    networks:
+      - webapp-network
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    environment:
+      - REDIS_HOSTS=local:redis:6379:0:admin
+      - HTTP_USER=admin
+      - HTTP_PASSWORD=admin
+    ports:
+      - "8081:8081"
+    networks:
+      - webapp-network
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: always
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    ports:
+      - "9090:9090"
+    networks:
+      - webapp-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_HTTP_PORT=3000
+      - GF_SERVER_DOMAIN=localhost
+      - GF_SERVER_ROOT_URL=http://localhost:3001
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - webapp-network
+    depends_on:
+      - prometheus
+    restart: always
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://admin:1987@db:5432/orders_db?sslmode=disable"
+    ports:
+      - "9187:9187"
+    networks:
+      - webapp-network
+    depends_on:
+      - db
+
+  redis-exporter:
+    image: oliver006/redis_exporter
+    environment:
+      REDIS_ADDR: "redis:6379"
+      REDIS_PASSWORD: "admin"
+    ports:
+      - "9121:9121"
+    networks:
+      - webapp-network
+    depends_on:
+      - redis
+
+networks:
+  webapp-network:
+    driver: bridge
+
+volumes:
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  grafana_data:
+    driver: local
+  uploads_data:
+    driver: local
+  prometheus_data:
+    driver: local
